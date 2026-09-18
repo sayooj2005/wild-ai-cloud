@@ -5,10 +5,6 @@ import numpy as np
 app = FastAPI(title="Wild AI Cloud")
 
 
-# ==========================================
-# HOME
-# ==========================================
-
 @app.get("/")
 async def home():
     return {
@@ -18,20 +14,12 @@ async def home():
     }
 
 
-# ==========================================
-# HEALTH CHECK
-# ==========================================
-
 @app.get("/health")
 async def health():
     return {
         "status": "healthy"
     }
 
-
-# ==========================================
-# ESP32-CAM WEBSOCKET
-# ==========================================
 
 @app.websocket("/ws/camera")
 async def camera_stream(websocket: WebSocket):
@@ -48,38 +36,46 @@ async def camera_stream(websocket: WebSocket):
 
         while True:
 
-            # Receive binary camera frame
+            # Receive JPEG frame from ESP32
             data = await websocket.receive_bytes()
 
             frame_count += 1
 
-            # Convert received bytes into image
+            print(
+                f"Frame received: "
+                f"{frame_count} | "
+                f"Bytes: {len(data)}"
+            )
+
+            # Convert JPEG bytes to NumPy array
             image_array = np.frombuffer(
                 data,
                 dtype=np.uint8
             )
 
+            # Decode JPEG
             frame = cv2.imdecode(
                 image_array,
                 cv2.IMREAD_COLOR
             )
 
-            # Check whether image decoding worked
             if frame is None:
-
-                print("Invalid image received")
-
+                print("Invalid JPEG frame")
                 continue
 
-            # Get image dimensions
+            # Get resolution
             height, width = frame.shape[:2]
 
             print(
-                f"Frame received: "
-                f"{frame_count} | "
-                f"Size: {width}x{height} | "
-                f"Bytes: {len(data)}"
+                f"Frame {frame_count} decoded: "
+                f"{width}x{height}"
             )
+
+            # =========================================
+            # THIS IS WHERE YOLO WILL GO LATER
+            # =========================================
+
+            # results = model(frame)
 
     except WebSocketDisconnect:
 
