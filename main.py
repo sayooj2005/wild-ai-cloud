@@ -1,854 +1,733 @@
-import asyncio
-import json
-import time
-from typing import Set
-
-import cv2
-import numpy as np
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, Response, JSONResponse
 
 from ultralytics import YOLO
 
+import cv2
+import numpy as np
+import asyncio
+import os
+import time
+
 
 # ============================================================
-# APPLICATION
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
-    title="Wild AI Cloud",
-    version="1.0"
+    title="Wild AI Cloud"
 )
 
 
 # ============================================================
-# GLOBAL VARIABLES
-# ============================================================
-
-latest_frame = None
-
-latest_processed_frame = None
-
-latest_detection_data = {
-    "timestamp": 0,
-    "detections": [],
-    "count": 0
-}
-
-
-# Website WebSocket clients
-website_clients: Set[WebSocket] = set()
-
-
-# ============================================================
-# YOLO MODEL
+# YOLO
 # ============================================================
 
 MODEL_NAME = "yolo11n.pt"
 
 print()
-print("==============================================")
-print("             WILD AI CLOUD")
-print("==============================================")
+print("==========================================")
+print("          WILD AI CLOUD")
+print("==========================================")
+print()
 
-print("Loading YOLO model:")
-print(MODEL_NAME)
+print("Loading YOLO model...")
 
 try:
 
+    # If yolo11n.pt is not present,
+    # Ultralytics downloads it automatically.
     model = YOLO(MODEL_NAME)
 
-    print("YOLO model loaded successfully.")
+    print("YOLO model loaded successfully")
+
+    print("Available classes:")
+    print(model.names)
 
 except Exception as e:
 
-    print("ERROR loading YOLO:")
-    print(str(e))
+    print("YOLO MODEL ERROR:")
+    print(e)
 
     model = None
 
 
 # ============================================================
-# JPEG CLEANING
+# GLOBAL CAMERA DATA
 # ============================================================
 
-def clean_jpeg(data: bytes):
+latest_raw_frame = None
 
-    if not data:
-        return None
+latest_annotated_frame = None
 
-    # JPEG start marker
-    start_marker = b"\xff\xd8"
+latest_detections = []
 
-    # JPEG end marker
-    end_marker = b"\xff\xd9"
+last_frame_time = 0
 
-    start = data.find(start_marker)
-
-    end = data.rfind(end_marker)
-
-    if start == -1:
-        print("JPEG start marker not found.")
-        return None
-
-    if end == -1:
-        print("JPEG end marker not found.")
-        return None
-
-    end += 2
-
-    cleaned = data[start:end]
-
-    return cleaned
+total_frames = 0
 
 
 # ============================================================
-# DECODE JPEG
+# LOCK
 # ============================================================
 
-def decode_jpeg(data: bytes):
-
-    cleaned = clean_jpeg(data)
-
-    if cleaned is None:
-        return None
-
-    try:
-
-        array = np.frombuffer(
-            cleaned,
-            dtype=np.uint8
-        )
-
-        frame = cv2.imdecode(
-            array,
-            cv2.IMREAD_COLOR
-        )
-
-        if frame is None:
-
-            print("OpenCV could not decode JPEG.")
-
-            return None
-
-        return frame
-
-    except Exception as e:
-
-        print(
-            "JPEG decode error:",
-            str(e)
-        )
-
-        return None
+frame_lock = asyncio.Lock()
 
 
 # ============================================================
-# YOLO DETECTION
-# ============================================================
-
-def detect_objects(frame):
-
-    global model
-
-    detections = []
-
-    if model is None:
-
-        return detections
-
-    try:
-
-        results = model.predict(
-            source=frame,
-            conf=0.35,
-            verbose=False,
-            imgsz=640
-        )
-
-        if not results:
-
-            return detections
-
-        result = results[0]
-
-        if result.boxes is None:
-
-            return detections
-
-        names = result.names
-
-        for box in result.boxes:
-
-            # Bounding box
-            xyxy = box.xyxy[0].cpu().numpy()
-
-            x1, y1, x2, y2 = map(
-                int,
-                xyxy
-            )
-
-            # Confidence
-            confidence = float(
-                box.conf[0].cpu().numpy()
-            )
-
-            # Class ID
-            class_id = int(
-                box.cls[0].cpu().numpy()
-            )
-
-            class_name = names[class_id]
-
-            detection = {
-                "class_id": class_id,
-                "class_name": class_name,
-                "confidence": round(
-                    confidence,
-                    3
-                ),
-                "bbox": [
-                    x1,
-                    y1,
-                    x2,
-                    y2
-                ]
-            }
-
-            detections.append(
-                detection
-            )
-
-            # Draw bounding box
-            cv2.rectangle(
-                frame,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),
-                2
-            )
-
-            # Label
-            label = (
-                f"{class_name} "
-                f"{confidence:.2f}"
-            )
-
-            # Text background
-            text_size = cv2.getTextSize(
-                label,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                2
-            )[0]
-
-            text_width = text_size[0]
-            text_height = text_size[1]
-
-            cv2.rectangle(
-                frame,
-                (
-                    x1,
-                    max(
-                        0,
-                        y1 - text_height - 10
-                    )
-                ),
-                (
-                    x1 + text_width + 6,
-                    y1
-                ),
-                (0, 255, 0),
-                -1
-            )
-
-            # Label text
-            cv2.putText(
-                frame,
-                label,
-                (
-                    x1 + 3,
-                    y1 - 5
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 0),
-                2
-            )
-
-        return detections
-
-    except Exception as e:
-
-        print(
-            "YOLO inference error:",
-            str(e)
-        )
-
-        return detections
-
-
-# ============================================================
-# PROCESS FRAME
-# ============================================================
-
-def process_frame(frame):
-
-    global latest_detection_data
-
-    # Make a copy for drawing
-    processed = frame.copy()
-
-    # Run YOLO
-    detections = detect_objects(
-        processed
-    )
-
-    # Current time
-    timestamp = time.time()
-
-    # Store detection information
-    latest_detection_data = {
-        "timestamp": timestamp,
-        "detections": detections,
-        "count": len(detections)
-    }
-
-    # Display detection count
-    status = (
-        f"Detections: {len(detections)}"
-    )
-
-    cv2.rectangle(
-        processed,
-        (0, 0),
-        (260, 35),
-        (0, 0, 0),
-        -1
-    )
-
-    cv2.putText(
-        processed,
-        status,
-        (10, 25),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
-
-    # Encode processed image
-    success, encoded = cv2.imencode(
-        ".jpg",
-        processed,
-        [
-            cv2.IMWRITE_JPEG_QUALITY,
-            80
-        ]
-    )
-
-    if not success:
-
-        return None
-
-    return encoded.tobytes()
-
-
-# ============================================================
-# SEND FRAME TO WEBSITE
-# ============================================================
-
-async def send_to_websites(
-    processed_frame,
-    detection_data
-):
-
-    disconnected = []
-
-    # Send detection metadata first
-    metadata = json.dumps(
-        {
-            "type": "detection",
-            **detection_data
-        }
-    )
-
-    for client in list(
-        website_clients
-    ):
-
-        try:
-
-            await client.send_text(
-                metadata
-            )
-
-            await client.send_bytes(
-                processed_frame
-            )
-
-        except Exception:
-
-            disconnected.append(
-                client
-            )
-
-    for client in disconnected:
-
-        website_clients.discard(
-            client
-        )
-
-
-# ============================================================
-# ROOT
+# HOME PAGE
 # ============================================================
 
 @app.get("/")
-async def root():
+async def home():
 
     return HTMLResponse(
         """
-        <!DOCTYPE html>
+<!DOCTYPE html>
 
-        <html>
+<html>
 
-        <head>
+<head>
 
-            <title>Wild AI Cloud</title>
+    <meta charset="UTF-8">
 
-            <style>
+    <title>Wild AI</title>
 
-                body {
-                    background: #101010;
-                    color: white;
-                    font-family: Arial;
-                    text-align: center;
-                }
+    <style>
 
-                img {
-                    max-width: 90%;
-                    border: 2px solid #444;
-                }
+        body {
+            background: #111;
+            color: white;
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin: 0;
+            padding: 20px;
+        }
 
-            </style>
+        h1 {
+            margin-bottom: 5px;
+        }
 
-        </head>
+        #status {
+            margin: 10px;
+            font-size: 18px;
+        }
 
-        <body>
+        #camera {
+            width: 640px;
+            max-width: 95%;
+            image-rendering: auto;
+            border: 2px solid white;
+            margin-top: 15px;
+        }
 
-            <h1>Wild AI Cloud</h1>
+        #detections {
+            margin-top: 20px;
+            font-size: 18px;
+        }
 
-            <p>
-                ESP32-CAM → Render → YOLO11n
-            </p>
+        .animal {
+            margin: 8px;
+            padding: 8px;
+            border: 1px solid #555;
+            display: inline-block;
+        }
 
-            <img
-                id="camera"
-                width="640"
-            >
+    </style>
 
-            <h2 id="status">
-                Waiting for camera...
-            </h2>
+</head>
 
-            <script>
 
-                const image =
-                    document.getElementById(
-                        "camera"
-                    );
+<body>
 
-                const status =
-                    document.getElementById(
-                        "status"
-                    );
+    <h1>WILD AI</h1>
 
-                const protocol =
-                    location.protocol === "https:"
-                    ? "wss://"
-                    : "ws://";
+    <div id="status">
+        Waiting for ESP32 camera...
+    </div>
 
-                const socket =
-                    new WebSocket(
-                        protocol +
-                        location.host +
-                        "/ws/website"
-                    );
+    <img
+        id="camera"
+        alt="Camera feed"
+    >
 
-                socket.binaryType =
-                    "blob";
+    <div id="detections">
+        No detections
+    </div>
 
-                socket.onopen = function() {
 
-                    status.innerText =
-                        "Connected to Wild AI Cloud";
+<script>
 
-                };
+const camera =
+    document.getElementById("camera");
 
-                socket.onmessage = function(event) {
+const status =
+    document.getElementById("status");
 
-                    if (
-                        typeof event.data ===
-                        "string"
-                    ) {
+const detections =
+    document.getElementById("detections");
 
-                        const data =
-                            JSON.parse(
-                                event.data
-                            );
 
-                        if (
-                            data.type ===
-                            "detection"
-                        ) {
+// ========================================================
+// GET PROCESSED CAMERA FRAME
+// ========================================================
 
-                            status.innerText =
-                                "Detections: " +
-                                data.count;
-                        }
+async function updateImage()
+{
+    try
+    {
+        const response =
+            await fetch(
+                "/latest?t=" + Date.now()
+            );
 
-                        return;
-                    }
+        if (!response.ok)
+        {
+            status.innerText =
+                "Waiting for camera frame...";
 
-                    const blob =
-                        event.data;
+            return;
+        }
 
-                    const url =
-                        URL.createObjectURL(
-                            blob
-                        );
 
-                    image.src = url;
+        const blob =
+            await response.blob();
 
-                };
 
-                socket.onclose = function() {
+        const imageURL =
+            URL.createObjectURL(blob);
 
-                    status.innerText =
-                        "Connection closed";
 
-                };
+        camera.src =
+            imageURL;
 
-            </script>
 
-        </body>
+        status.innerText =
+            "ESP32 camera + YOLO active";
+    }
 
-        </html>
-        """
+    catch(error)
+    {
+        status.innerText =
+            "Connection error";
+    }
+}
+
+
+// ========================================================
+// GET DETECTIONS
+// ========================================================
+
+async function updateDetections()
+{
+    try
+    {
+        const response =
+            await fetch(
+                "/detections?t=" + Date.now()
+            );
+
+
+        if (!response.ok)
+        {
+            return;
+        }
+
+
+        const data =
+            await response.json();
+
+
+        if (
+            !data.detections ||
+            data.detections.length === 0
+        )
+        {
+            detections.innerHTML =
+                "No animals detected";
+
+            return;
+        }
+
+
+        let html = "";
+
+
+        data.detections.forEach(
+            function(item)
+            {
+                html +=
+                    '<div class="animal">' +
+                    '<b>' +
+                    item.class +
+                    '</b>' +
+                    ' — ' +
+                    (item.confidence * 100).toFixed(1) +
+                    '%' +
+                    '</div>';
+            }
+        );
+
+
+        detections.innerHTML =
+            html;
+
+    }
+
+    catch(error)
+    {
+        console.log(error);
+    }
+}
+
+
+// ========================================================
+// UPDATE
+// ========================================================
+
+setInterval(
+    updateImage,
+    1000
+);
+
+
+setInterval(
+    updateDetections,
+    1000
+);
+
+
+updateImage();
+
+updateDetections();
+
+</script>
+
+
+</body>
+
+</html>
+"""
     )
 
 
 # ============================================================
-# HEALTH
+# CAMERA WEBSOCKET
+# ============================================================
+
+@app.websocket("/ws/camera")
+async def camera_websocket(websocket: WebSocket):
+
+    global latest_raw_frame
+    global latest_annotated_frame
+    global latest_detections
+    global last_frame_time
+    global total_frames
+
+
+    # --------------------------------------------------------
+    # ACCEPT ESP32 CONNECTION
+    # --------------------------------------------------------
+
+    await websocket.accept()
+
+
+    print()
+    print("==========================================")
+    print("ESP32 CAMERA CONNECTED")
+    print("==========================================")
+    print()
+
+
+    try:
+
+        while True:
+
+            # =================================================
+            # RECEIVE BINARY JPEG
+            # =================================================
+
+            data = await websocket.receive_bytes()
+
+
+            if not data:
+                continue
+
+
+            total_frames += 1
+
+
+            print(
+                f"FRAME RECEIVED: "
+                f"{len(data)} bytes"
+            )
+
+
+            # =================================================
+            # JPEG -> NUMPY
+            # =================================================
+
+            np_array = np.frombuffer(
+                data,
+                dtype=np.uint8
+            )
+
+
+            # =================================================
+            # NUMPY -> OPENCV
+            # =================================================
+
+            frame = cv2.imdecode(
+                np_array,
+                cv2.IMREAD_COLOR
+            )
+
+
+            if frame is None:
+
+                print(
+                    "ERROR: JPEG decode failed"
+                )
+
+                continue
+
+
+            print(
+                f"IMAGE DECODED: "
+                f"{frame.shape[1]}x"
+                f"{frame.shape[0]}"
+            )
+
+
+            # =================================================
+            # SAVE RAW FRAME
+            # =================================================
+
+            async with frame_lock:
+
+                latest_raw_frame = frame.copy()
+
+                last_frame_time = time.time()
+
+
+            # =================================================
+            # YOLO
+            # =================================================
+
+            if model is None:
+
+                print(
+                    "YOLO model is not available"
+                )
+
+                async with frame_lock:
+
+                    latest_annotated_frame = (
+                        frame.copy()
+                    )
+
+                continue
+
+
+            try:
+
+                # ------------------------------------------------
+                # YOLO DETECTION
+                # ------------------------------------------------
+
+                results = model.predict(
+                    source=frame,
+                    imgsz=320,
+                    conf=0.25,
+                    verbose=False
+                )
+
+
+                result = results[0]
+
+
+                # ------------------------------------------------
+                # DRAW BOUNDING BOXES
+                # ------------------------------------------------
+
+                annotated_frame =
+                    result.plot()
+
+
+                # ------------------------------------------------
+                # DETECTION LIST
+                # ------------------------------------------------
+
+                detections = []
+
+
+                if result.boxes is not None:
+
+                    for box in result.boxes:
+
+                        try:
+
+                            class_id = int(
+                                box.cls[0].item()
+                            )
+
+
+                            confidence = float(
+                                box.conf[0].item()
+                            )
+
+
+                            class_name = (
+                                result.names[
+                                    class_id
+                                ]
+                            )
+
+
+                            coordinates = (
+                                box.xyxy[0]
+                                .tolist()
+                            )
+
+
+                            x1 = int(
+                                coordinates[0]
+                            )
+
+                            y1 = int(
+                                coordinates[1]
+                            )
+
+                            x2 = int(
+                                coordinates[2]
+                            )
+
+                            y2 = int(
+                                coordinates[3]
+                            )
+
+
+                            detection = {
+
+                                "class":
+                                    class_name,
+
+                                "confidence":
+                                    round(
+                                        confidence,
+                                        3
+                                    ),
+
+                                "x1": x1,
+
+                                "y1": y1,
+
+                                "x2": x2,
+
+                                "y2": y2
+                            }
+
+
+                            detections.append(
+                                detection
+                            )
+
+
+                            print(
+                                "ANIMAL DETECTED: "
+                                f"{class_name} "
+                                f"confidence="
+                                f"{confidence:.2f}"
+                            )
+
+
+                        except Exception as e:
+
+                            print(
+                                "Detection parsing error:",
+                                e
+                            )
+
+
+                # ------------------------------------------------
+                # SAVE RESULTS
+                # ------------------------------------------------
+
+                async with frame_lock:
+
+                    latest_annotated_frame = (
+                        annotated_frame.copy()
+                    )
+
+                    latest_detections = (
+                        detections
+                    )
+
+
+            except Exception as e:
+
+                print(
+                    "YOLO PROCESSING ERROR:"
+                )
+
+                print(e)
+
+
+                async with frame_lock:
+
+                    latest_annotated_frame = (
+                        frame.copy()
+                    )
+
+                    latest_detections = []
+
+
+    except WebSocketDisconnect:
+
+        print()
+        print("==========================================")
+        print("ESP32 CAMERA DISCONNECTED")
+        print("==========================================")
+
+
+    except Exception as e:
+
+        print()
+        print("WEBSOCKET ERROR:")
+        print(e)
+
+
+# ============================================================
+# LATEST PROCESSED IMAGE
+# ============================================================
+
+@app.get("/latest")
+async def latest():
+
+    async with frame_lock:
+
+        if latest_annotated_frame is None:
+
+            return Response(
+                content=b"",
+                media_type="image/jpeg",
+                status_code=404
+            )
+
+
+        frame =
+            latest_annotated_frame.copy()
+
+
+    # ========================================================
+    # OPENCV -> JPEG
+    # ========================================================
+
+    success, encoded =
+        cv2.imencode(
+            ".jpg",
+            frame,
+            [
+                cv2.IMWRITE_JPEG_QUALITY,
+                85
+            ]
+        )
+
+
+    if not success:
+
+        return Response(
+            content=b"",
+            media_type="image/jpeg",
+            status_code=500
+        )
+
+
+    return Response(
+        content=encoded.tobytes(),
+        media_type="image/jpeg"
+    )
+
+
+# ============================================================
+# DETECTIONS API
+# ============================================================
+
+@app.get("/detections")
+async def get_detections():
+
+    async with frame_lock:
+
+        return JSONResponse(
+            content={
+                "detections":
+                    latest_detections,
+
+                "total_frames":
+                    total_frames,
+
+                "camera_active":
+                    latest_raw_frame is not None,
+
+                "yolo_active":
+                    model is not None
+            }
+        )
+
+
+# ============================================================
+# HEALTH CHECK
 # ============================================================
 
 @app.get("/health")
 async def health():
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "yolo_loaded": model is not None,
-            "camera_connected":
-                latest_frame is not None,
-            "detections":
-                latest_detection_data
-        }
-    )
+    async with frame_lock:
+
+        camera_active =
+            latest_raw_frame is not None
+
+        detection_count =
+            len(latest_detections)
+
+
+    return {
+        "status": "online",
+
+        "camera": camera_active,
+
+        "yolo": model is not None,
+
+        "detections": detection_count,
+
+        "frames_received":
+            total_frames
+    }
 
 
 # ============================================================
-# ESP32 CAMERA WEBSOCKET
+# ROOT STATUS
 # ============================================================
 
-@app.websocket("/ws/camera")
-async def camera_websocket(
-    websocket: WebSocket
-):
+@app.get("/status")
+async def status():
 
-    global latest_frame
-    global latest_processed_frame
+    return {
+        "service":
+            "Wild AI Cloud",
 
-    await websocket.accept()
+        "model":
+            MODEL_NAME,
 
-    print()
-    print(
-        "=============================================="
-    )
+        "model_loaded":
+            model is not None,
 
-    print(
-        "ESP32 CAMERA CONNECTED"
-    )
+        "frames_received":
+            total_frames,
 
-    print(
-        "=============================================="
-    )
+        "camera_connected":
+            latest_raw_frame is not None,
 
-    try:
-
-        while True:
-
-            message = await websocket.receive()
-
-            # ------------------------------------------------
-            # BINARY CAMERA FRAME
-            # ------------------------------------------------
-
-            if "bytes" in message:
-
-                data = message["bytes"]
-
-                if not data:
-
-                    continue
-
-                print(
-                    f"Frame received: "
-                    f"{len(data)} bytes"
-                )
-
-                # Clean JPEG
-                cleaned = clean_jpeg(
-                    data
-                )
-
-                if cleaned is None:
-
-                    print(
-                        "Invalid JPEG frame."
-                    )
-
-                    continue
-
-                print(
-                    f"Clean JPEG: "
-                    f"{len(cleaned)} bytes"
-                )
-
-                # Decode
-                frame = decode_jpeg(
-                    cleaned
-                )
-
-                if frame is None:
-
-                    continue
-
-                height, width = (
-                    frame.shape[:2]
-                )
-
-                print(
-                    "JPEG decoded successfully: "
-                    f"({height}, {width}, 3)"
-                )
-
-                latest_frame = frame
-
-                # ------------------------------------------------
-                # YOLO
-                # ------------------------------------------------
-
-                start_time = time.time()
-
-                processed = process_frame(
-                    frame
-                )
-
-                inference_time = (
-                    time.time()
-                    - start_time
-                )
-
-                if processed is None:
-
-                    continue
-
-                latest_processed_frame = (
-                    processed
-                )
-
-                # ------------------------------------------------
-                # DETECTIONS
-                # ------------------------------------------------
-
-                detections = (
-                    latest_detection_data[
-                        "detections"
-                    ]
-                )
-
-                if detections:
-
-                    print(
-                        "DETECTIONS:"
-                    )
-
-                    for detection in detections:
-
-                        print(
-                            "  "
-                            f"{detection['class_name']} "
-                            f""
-                            f"{detection['confidence']:.2f}"
-                        )
-
-                else:
-
-                    print(
-                        "No objects detected."
-                    )
-
-                print(
-                    f"YOLO processing time: "
-                    f"{inference_time:.2f}s"
-                )
-
-                # ------------------------------------------------
-                # WEBSITE
-                # ------------------------------------------------
-
-                await send_to_websites(
-                    processed,
-                    latest_detection_data
-                )
-
-            # ------------------------------------------------
-            # TEXT MESSAGE
-            # ------------------------------------------------
-
-            elif "text" in message:
-
-                text = message["text"]
-
-                print(
-                    "Camera message:",
-                    text
-                )
-
-    except WebSocketDisconnect:
-
-        print(
-            "ESP32 camera disconnected."
-        )
-
-    except Exception as e:
-
-        print(
-            "Camera WebSocket error:",
-            str(e)
-        )
-
-
-# ============================================================
-# WEBSITE WEBSOCKET
-# ============================================================
-
-@app.websocket("/ws/website")
-async def website_websocket(
-    websocket: WebSocket
-):
-
-    await websocket.accept()
-
-    website_clients.add(
-        websocket
-    )
-
-    print(
-        "Website connected."
-    )
-
-    try:
-
-        # Send latest detection state
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "type": "detection",
-                    **latest_detection_data
-                }
-            )
-        )
-
-        while True:
-
-            await websocket.receive_text()
-
-    except WebSocketDisconnect:
-
-        print(
-            "Website disconnected."
-        )
-
-    except Exception as e:
-
-        print(
-            "Website WebSocket error:",
-            str(e)
-        )
-
-    finally:
-
-        website_clients.discard(
-            websocket
-        )
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-@app.on_event("startup")
-async def startup_event():
-
-    print()
-    print(
-        "=============================================="
-    )
-
-    print(
-        "       WILD AI CLOUD SERVER STARTED"
-    )
-
-    print(
-        "=============================================="
-    )
-
-    print(
-        "Camera WebSocket:"
-    )
-
-    print(
-        "/ws/camera"
-    )
-
-    print(
-        "Website WebSocket:"
-    )
-
-    print(
-        "/ws/website"
-    )
-
-    print(
-        "Health:"
-    )
-
-    print(
-        "/health"
-    )
-
-    print(
-        "YOLO model:"
-    )
-
-    print(
-        MODEL_NAME
-    )
-
-    print(
-        "=============================================="
-    )
+        "detections":
+            latest_detections
+    }
