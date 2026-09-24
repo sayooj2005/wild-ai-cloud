@@ -7,17 +7,34 @@ import numpy as np
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+
 from ultralytics import YOLO
 
 
 # ============================================================
 # WILD AI CLOUD
-# ESP32-CAM -> RENDER -> YOLO
+#
+# ESP32-CAM
+#     ↓
+# WebSocket
+#     ↓
+# Render
+#     ↓
+# JPEG cleaning
+#     ↓
+# OpenCV
+#     ↓
+# YOLO11n
+#     ↓
+# Detection + bounding box
+#     ↓
+# Website
 # ============================================================
+
 
 app = FastAPI(
     title="Wild AI Cloud",
-    version="1.0.0"
+    version="1.0"
 )
 
 
@@ -27,30 +44,29 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
+
     allow_origins=["*"],
+
     allow_credentials=True,
+
     allow_methods=["*"],
+
     allow_headers=["*"],
 )
 
 
 # ============================================================
-# PROJECT SETTINGS
+# SETTINGS
 # ============================================================
 
 CAMERA_ID = "CAM_01"
 
-# Pretrained YOLO model.
-# NO best.pt is required.
 MODEL_NAME = "yolo11n.pt"
 
-# Detection confidence
 CONFIDENCE = 0.40
 
-# Smaller image = less CPU usage on Render Free
 IMAGE_SIZE = 416
 
-# Start with 2 FPS
 MAX_FPS = 2
 
 MIN_INTERVAL = 1.0 / MAX_FPS
@@ -81,9 +97,8 @@ print("==========================================")
 print("          WILD AI CLOUD")
 print("==========================================")
 
-print("Starting server...")
 print("")
-print("Loading pretrained YOLO11n...")
+print("Loading YOLO11n...")
 print("")
 
 
@@ -91,25 +106,21 @@ try:
 
     model = YOLO(MODEL_NAME)
 
-    print(
-        "YOLO11n loaded successfully."
-    )
+    print("")
+    print("YOLO11n loaded successfully.")
+    print("")
 
 except Exception as error:
 
     print("")
-    print(
-        "ERROR: YOLO could not be loaded."
-    )
-
+    print("ERROR LOADING YOLO:")
     print(error)
 
     model = None
 
 
-print("")
 print("==========================================")
-print("          YOLO READY")
+print("              AI READY")
 print("==========================================")
 print("")
 
@@ -123,11 +134,11 @@ async def home():
 
     return {
 
-        "project": "Wild AI",
+        "project": "Wild AI Cloud",
 
         "status": "running",
 
-        "camera_id": CAMERA_ID,
+        "camera": CAMERA_ID,
 
         "camera_connected":
             camera_connected,
@@ -173,36 +184,25 @@ async def broadcast_json(data):
         return
 
 
-    message = json.dumps(
-        data
-    )
-
+    message = json.dumps(data)
 
     disconnected = []
 
 
-    for client in list(
-        website_clients
-    ):
+    for client in list(website_clients):
 
         try:
 
-            await client.send_text(
-                message
-            )
+            await client.send_text(message)
 
         except Exception:
 
-            disconnected.append(
-                client
-            )
+            disconnected.append(client)
 
 
     for client in disconnected:
 
-        website_clients.discard(
-            client
-        )
+        website_clients.discard(client)
 
 
 # ============================================================
@@ -232,6 +232,10 @@ async def broadcast_frame(frame):
 
         if not success:
 
+            print(
+                "ERROR: Could not encode processed frame."
+            )
+
             return
 
 
@@ -251,9 +255,7 @@ async def broadcast_frame(frame):
     disconnected = []
 
 
-    for client in list(
-        website_clients
-    ):
+    for client in list(website_clients):
 
         try:
 
@@ -263,16 +265,76 @@ async def broadcast_frame(frame):
 
         except Exception:
 
-            disconnected.append(
-                client
-            )
+            disconnected.append(client)
 
 
     for client in disconnected:
 
-        website_clients.discard(
-            client
-        )
+        website_clients.discard(client)
+
+
+# ============================================================
+# CLEAN JPEG
+# ============================================================
+
+def clean_jpeg(jpeg_data):
+
+    """
+    ESP32 sends JPEG data through WebSocket.
+
+    Sometimes the received buffer can contain
+    bytes before the actual JPEG.
+
+    JPEG starts with:
+
+        FF D8
+
+    JPEG ends with:
+
+        FF D9
+
+    This function extracts only the JPEG portion.
+    """
+
+    # --------------------------------------------------------
+    # Find JPEG START
+    # --------------------------------------------------------
+
+    start_marker = jpeg_data.find(
+        b"\xff\xd8"
+    )
+
+
+    if start_marker == -1:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # Find JPEG END
+    # --------------------------------------------------------
+
+    end_marker = jpeg_data.rfind(
+        b"\xff\xd9"
+    )
+
+
+    if end_marker == -1:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # Extract actual JPEG
+    # --------------------------------------------------------
+
+    cleaned = jpeg_data[
+        start_marker:
+        end_marker + 2
+    ]
+
+
+    return cleaned
 
 
 # ============================================================
@@ -314,14 +376,17 @@ def detect_objects(frame):
 
 
         # ====================================================
-        # PROCESS EVERY DETECTION
+        # PROCESS DETECTIONS
         # ====================================================
 
         for box in result.boxes:
 
             try:
 
-                # Bounding box
+                # ------------------------------------------------
+                # BOUNDING BOX
+                # ------------------------------------------------
+
                 coordinates = (
                     box.xyxy[0]
                     .cpu()
@@ -335,7 +400,10 @@ def detect_objects(frame):
                 )
 
 
-                # Confidence
+                # ------------------------------------------------
+                # CONFIDENCE
+                # ------------------------------------------------
+
                 confidence = float(
                     box.conf[0]
                     .cpu()
@@ -343,7 +411,10 @@ def detect_objects(frame):
                 )
 
 
-                # Class ID
+                # ------------------------------------------------
+                # CLASS ID
+                # ------------------------------------------------
+
                 class_id = int(
                     box.cls[0]
                     .cpu()
@@ -351,17 +422,18 @@ def detect_objects(frame):
                 )
 
 
-                # Class name
-                class_name = (
-                    result.names[
-                        class_id
-                    ]
-                )
+                # ------------------------------------------------
+                # CLASS NAME
+                # ------------------------------------------------
+
+                class_name = result.names[
+                    class_id
+                ]
 
 
-                # =================================================
-                # DETECTION OBJECT
-                # =================================================
+                # ------------------------------------------------
+                # DETECTION DATA
+                # ------------------------------------------------
 
                 detection = {
 
@@ -392,9 +464,9 @@ def detect_objects(frame):
                 )
 
 
-                # =================================================
+                # ------------------------------------------------
                 # DRAW BOUNDING BOX
-                # =================================================
+                # ------------------------------------------------
 
                 cv2.rectangle(
 
@@ -410,9 +482,9 @@ def detect_objects(frame):
                 )
 
 
-                # =================================================
+                # ------------------------------------------------
                 # LABEL
-                # =================================================
+                # ------------------------------------------------
 
                 label = (
                     f"{class_name} "
@@ -428,7 +500,6 @@ def detect_objects(frame):
 
                     (
                         x1,
-
                         max(
                             25,
                             y1 - 10
@@ -465,7 +536,7 @@ def detect_objects(frame):
 
 
 # ============================================================
-# ESP32-CAM WEBSOCKET
+# ESP32 CAMERA WEBSOCKET
 # ============================================================
 
 @app.websocket("/ws/camera")
@@ -477,7 +548,7 @@ async def camera_websocket(
 
 
     # ========================================================
-    # ACCEPT
+    # ACCEPT CONNECTION
     # ========================================================
 
     await websocket.accept()
@@ -493,10 +564,14 @@ async def camera_websocket(
 
     print("")
     print("==========================================")
-    print("ESP32-CAM CONNECTED")
+    print("        ESP32-CAM CONNECTED")
     print("==========================================")
     print("")
 
+
+    # ========================================================
+    # INFORM WEBSITE
+    # ========================================================
 
     await broadcast_json({
 
@@ -525,6 +600,10 @@ async def camera_websocket(
 
         while True:
 
+            # ==================================================
+            # RECEIVE WEBSOCKET MESSAGE
+            # ==================================================
+
             message = await websocket.receive()
 
 
@@ -538,7 +617,7 @@ async def camera_websocket(
 
 
                 print(
-                    "ESP32:",
+                    "ESP32 message:",
                     text
                 )
 
@@ -547,189 +626,248 @@ async def camera_websocket(
 
 
             # ==================================================
-            # BINARY JPEG FRAME
+            # BINARY MESSAGE
             # ==================================================
 
-            if "bytes" in message:
+            if "bytes" not in message:
 
-                jpeg_data = message[
-                    "bytes"
-                ]
+                continue
 
 
-                if not jpeg_data:
-
-                    continue
+            jpeg_data = message["bytes"]
 
 
-                # =================================================
-                # LIMIT PROCESSING FPS
-                # =================================================
+            if not jpeg_data:
 
-                current_time = time.time()
+                continue
 
 
-                if (
-                    current_time
-                    - last_processing_time
-                    <
-                    MIN_INTERVAL
-                ):
+            # ==================================================
+            # FPS LIMIT
+            # ==================================================
 
-                    continue
+            current_time = time.time()
 
 
-                last_processing_time = (
-                    current_time
+            if (
+                current_time
+                - last_processing_time
+                <
+                MIN_INTERVAL
+            ):
+
+                continue
+
+
+            last_processing_time = (
+                current_time
+            )
+
+
+            # ==================================================
+            # RAW FRAME INFORMATION
+            # ==================================================
+
+            print("")
+            print("------------------------------------------")
+
+            print(
+                "Frame received:",
+                len(jpeg_data),
+                "bytes"
+            )
+
+
+            # ==================================================
+            # CLEAN JPEG
+            # ==================================================
+
+            clean_data = clean_jpeg(
+                jpeg_data
+            )
+
+
+            if clean_data is None:
+
+                print(
+                    "ERROR: JPEG markers not found."
+                )
+
+                continue
+
+
+            print(
+                "Clean JPEG:",
+                len(clean_data),
+                "bytes"
+            )
+
+
+            # ==================================================
+            # NUMPY ARRAY
+            # ==================================================
+
+            array = np.frombuffer(
+
+                clean_data,
+
+                dtype=np.uint8
+            )
+
+
+            # ==================================================
+            # JPEG -> OPENCV
+            # ==================================================
+
+            frame = cv2.imdecode(
+
+                array,
+
+                cv2.IMREAD_COLOR
+            )
+
+
+            # ==================================================
+            # CHECK DECODING
+            # ==================================================
+
+            if frame is None:
+
+                print(
+                    "ERROR: OpenCV could not decode JPEG."
+                )
+
+                continue
+
+
+            # ==================================================
+            # SUCCESS
+            # ==================================================
+
+            print(
+                "JPEG decoded successfully:",
+                frame.shape
+            )
+
+
+            # ==================================================
+            # YOLO
+            # ==================================================
+
+            processed_frame, detections = (
+                await asyncio.to_thread(
+
+                    detect_objects,
+
+                    frame
+                )
+            )
+
+
+            # ==================================================
+            # DETECTION RESULT
+            # ==================================================
+
+            result = {
+
+                "type":
+                    "detection",
+
+                "camera":
+                    CAMERA_ID,
+
+                "timestamp":
+                    time.time(),
+
+                "image_width":
+                    int(
+                        frame.shape[1]
+                    ),
+
+                "image_height":
+                    int(
+                        frame.shape[0]
+                    ),
+
+                "detections":
+                    detections
+            }
+
+
+            # ==================================================
+            # PRINT DETECTIONS
+            # ==================================================
+
+            if detections:
+
+                print("")
+                print(
+                    "=========================================="
+                )
+
+                print(
+                    "           OBJECT DETECTED"
+                )
+
+                print(
+                    "=========================================="
                 )
 
 
-                # =================================================
-                # JPEG -> NUMPY
-                # =================================================
-
-                array = np.frombuffer(
-
-                    jpeg_data,
-
-                    dtype=np.uint8
-                )
-
-
-                # =================================================
-                # NUMPY -> OPENCV
-                # =================================================
-
-                frame = cv2.imdecode(
-
-                    array,
-
-                    cv2.IMREAD_COLOR
-                )
-
-
-                if frame is None:
+                for detection in detections:
 
                     print(
-                        "Invalid JPEG frame."
+                        "Animal/Object:",
+                        detection[
+                            "animal"
+                        ]
                     )
 
-                    continue
+
+                    print(
+                        "Confidence:",
+                        detection[
+                            "confidence"
+                        ]
+                    )
+
+
+                    print(
+                        "Bounding box:",
+                        detection[
+                            "bbox"
+                        ]
+                    )
 
 
                 print(
-                    "Frame received:",
-                    len(jpeg_data),
-                    "bytes"
+                    "=========================================="
                 )
 
 
-                # =================================================
-                # RUN YOLO
-                # =================================================
+            else:
 
-                processed_frame, detections = (
-                    await asyncio.to_thread(
-                        detect_objects,
-                        frame
-                    )
+                print(
+                    "No object detected."
                 )
 
 
-                # =================================================
-                # RESULT JSON
-                # =================================================
+            # ==================================================
+            # SEND DETECTION JSON TO WEBSITE
+            # ==================================================
 
-                result = {
-
-                    "type":
-                        "detection",
-
-                    "camera":
-                        CAMERA_ID,
-
-                    "timestamp":
-                        time.time(),
-
-                    "detections":
-                        detections
-                }
+            await broadcast_json(
+                result
+            )
 
 
-                # =================================================
-                # PRINT RESULTS
-                # =================================================
+            # ==================================================
+            # SEND PROCESSED FRAME
+            # ==================================================
 
-                if detections:
-
-                    print("")
-                    print(
-                        "================================"
-                    )
-
-                    print(
-                        "        OBJECT DETECTED"
-                    )
-
-                    print(
-                        "================================"
-                    )
-
-
-                    for detection in detections:
-
-                        print(
-                            "Animal/Object:",
-                            detection[
-                                "animal"
-                            ]
-                        )
-
-
-                        print(
-                            "Confidence:",
-                            detection[
-                                "confidence"
-                            ]
-                        )
-
-
-                        print(
-                            "Bounding box:",
-                            detection[
-                                "bbox"
-                            ]
-                        )
-
-
-                    print(
-                        "================================"
-                    )
-
-
-                else:
-
-                    print(
-                        "No object detected."
-                    )
-
-
-                # =================================================
-                # SEND DETECTION TO WEBSITE
-                # =================================================
-
-                await broadcast_json(
-                    result
-                )
-
-
-                # =================================================
-                # SEND PROCESSED FRAME
-                # =================================================
-
-                await broadcast_frame(
-                    processed_frame
-                )
+            await broadcast_frame(
+                processed_frame
+            )
 
 
     except WebSocketDisconnect:
@@ -742,10 +880,12 @@ async def camera_websocket(
 
     except Exception as error:
 
+        print("")
         print(
-            "Camera WebSocket error:",
-            error
+            "Camera WebSocket error:"
         )
+
+        print(error)
 
 
     finally:
@@ -759,6 +899,10 @@ async def camera_websocket(
             len(camera_clients) > 0
         )
 
+
+        # ====================================================
+        # INFORM WEBSITE
+        # ====================================================
 
         await broadcast_json({
 
@@ -801,7 +945,7 @@ async def website_websocket(
 
 
     # ========================================================
-    # SEND INITIAL STATUS
+    # INITIAL STATUS
     # ========================================================
 
     await websocket.send_text(
@@ -900,7 +1044,7 @@ async def startup():
 
     print("")
     print(
-        "YOLO:"
+        "YOLO model:"
     )
 
     print(
