@@ -4,3 +4,5 @@ websockets
 opencv-python-headless
 numpy
 ultralytics
+torch
+torchvision
