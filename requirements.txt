@@ -1,7 +1,10 @@
 fastapi
 uvicorn[standard]
-websockets
+sqlalchemy
+twilio
+requests
+pillow
+ultralytics
+python-multipart
 opencv-python-headless
 numpy
-ultralytics
-
